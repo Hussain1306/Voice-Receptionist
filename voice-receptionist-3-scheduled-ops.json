@@ -1,0 +1,954 @@
+{
+  "name": "Voice Receptionist 3/3 - Scheduled Ops (Retry Queue + Reminders)",
+  "nodes": [
+    {
+      "id": "dd5dfb39-da7b-4423-89bc-44afe771c645",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        -360
+      ],
+      "parameters": {
+        "width": 1000,
+        "height": 300,
+        "content": "## Voice Receptionist 3/3 - Scheduled Ops\n**Branch A (every 10 min):** retries `Pending_Bookings` created when the calendar was down. Success -> event created + SMS confirmation + row confirmed. 3 failures -> **HITL** email to staff (approve = staff will call the customer, decline = close request), customer is notified.\n**Branch B (hourly):** sends reminders ~24h before voice-booked appointments (SMS, email fallback), then marks the event as reminded so it never double-sends.\n\n**Setup:** Sheet tab `Pending_Bookings` headers: requestId, createdAt, status, attempts, name, phone, email, service, start, end, notes, callId, lastError. Update the calendar ID / timezone constants in the Code nodes."
+      }
+    },
+    {
+      "id": "716701a7-d074-42c0-b8b6-ce2976c6d338",
+      "name": "Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7d6ae756-eb9f-4a75-9ccb-7da9f149fb3b",
+      "name": "Read Pending Bookings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        200
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Pending_Bookings"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "status",
+              "lookupValue": "pending"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "alwaysOutputData": false
+    },
+    {
+      "id": "97fdb441-9ed5-418d-afe2-fbbbbcc4142b",
+      "name": "Prepare Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        200
+      ],
+      "parameters": {
+        "jsCode": "\nconst CAL_ID = 'primary', TZ = 'America/New_York';   // <-- match workflow 1 config\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\nreturn $input.all().map(i => {\n  const r = i.json;\n  const body = { summary: `${r.service} - ${r.name}`, description: `Booked by AI receptionist (recovered from request queue).\\nPhone: ${r.phone}\\nNotes: ${r.notes || ''}`,\n    start: { dateTime: r.start, timeZone: TZ }, end: { dateTime: r.end, timeZone: TZ }, attendees: r.email ? [{ email: r.email }] : undefined,\n    extendedProperties: { private: { phone: String(r.phone || '').replace(/\\D/g, ''), name: r.name, service: r.service, email: r.email || '', callId: r.callId || '', source: 'voice-ai' } },\n    id: hid(`${r.callId}|${r.start}|${String(r.phone || '').replace(/\\D/g, '')}`) };\n  const label = DateTime.fromISO(r.start, { zone: TZ }).toFormat(\"cccc, LLLL d 'at' h:mm a\");\n  return { json: { row: r, calendarId: CAL_ID, eventBody: body, label } };\n});\n"
+      }
+    },
+    {
+      "id": "4e3057d8-1107-4b62-9324-c6a29a8513be",
+      "name": "GCal - Create Event (retry)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.calendarId) }}/events?sendUpdates=all",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.eventBody) }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "314ad996-ec4b-49cc-bc0a-5628a10610a6",
+      "name": "Make Confirmed Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        100
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $('Prepare Retry').item.json;\nreturn { json: { requestId: p.row.requestId, status: 'confirmed', attempts: Number(p.row.attempts || 0) + 1, lastError: '' } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "00c7320b-91b1-4933-9091-eaede3d2c787",
+      "name": "Mark Confirmed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        100
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Pending_Bookings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "requestId"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "9030dac8-e9b1-4776-8905-53a17a710c03",
+      "name": "SMS - Booking Confirmed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        260
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/REPLACE_ACCOUNT_SID/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $('Prepare Retry').item.json.row.phone }}"
+            },
+            {
+              "name": "From",
+              "value": "+10000000000"
+            },
+            {
+              "name": "Body",
+              "value": "=Good news - your appointment is confirmed for {{ $('Prepare Retry').item.json.label }}. Call us if you need to change it."
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE",
+          "name": "Twilio (AccountSID:AuthToken)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "71700312-7c0e-497a-b04c-fdd2d303fd5b",
+      "name": "Register Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        440
+      ],
+      "parameters": {
+        "jsCode": "\nconst row = $('Prepare Retry').item.json.row;\nconst msg = String($json.error?.message || $json.error || '').slice(0, 200);\nconst dup = /409|already exists/i.test(msg);\nconst attempts = Number(row.attempts || 0) + 1;\nconst status = dup ? 'confirmed' : attempts >= 3 ? 'needs_human' : 'pending';\nreturn { json: { requestId: row.requestId, status, attempts, lastError: msg, name: row.name, phone: row.phone, service: row.service, start: row.start } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "475fbfd0-485e-4d54-b51f-0aca35fe4a4d",
+      "name": "Mark Attempt",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1200,
+        440
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Pending_Bookings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "requestId"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "08bc32f8-f7db-45b5-b084-dc63c2b35465",
+      "name": "Needs Human?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "fbb3295c-33c0-4263-8d88-932ca1e110de",
+              "leftValue": "={{ $('Register Failure').item.json.status === 'needs_human' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "73423eab-0172-4396-9884-a3b19d4e32ba",
+      "name": "HITL - Manual Booking Decision",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        380
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "manager@yourcompany.com",
+        "subject": "=Booking request needs a human: {{ $('Register Failure').item.json.name }}",
+        "message": "=The system could not auto-confirm this appointment request after 3 attempts.\n\nName: {{ $('Register Failure').item.json.name }}\nPhone: {{ $('Register Failure').item.json.phone }}\nService: {{ $('Register Failure').item.json.service }}\nRequested start: {{ $('Register Failure').item.json.start }}\nLast error: {{ $('Register Failure').item.json.lastError }}\n\nApprove = staff will call the customer and book manually. Decline = close the request.",
+        "responseType": "approval",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "I'll handle it",
+            "disapproveLabel": "Close request"
+          }
+        },
+        "options": {
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 24,
+              "resumeUnit": "hours"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "6d217c97-05f8-4862-ac10-545501935424"
+    },
+    {
+      "id": "9c0865bf-f944-47b0-9ba1-692b566548b6",
+      "name": "Make Resolution Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        380
+      ],
+      "parameters": {
+        "jsCode": "\nconst f = $('Register Failure').item.json, ok = $input.first().json?.data?.approved === true;\nreturn { json: { requestId: f.requestId, status: ok ? 'manual_followup' : 'closed', phone: f.phone,\n  sms: ok ? 'Thanks for your request - a team member will call you shortly to confirm your appointment.' : 'Sorry, we could not confirm your requested time. Please call us and we will find a slot that works.' } };\n",
+        "mode": "runOnceForEachItem"
+      }
+    },
+    {
+      "id": "c4e4f74f-83b7-4e5d-9585-09fd28d89195",
+      "name": "Mark Resolution",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2160,
+        380
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Pending_Bookings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "requestId"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "b85f73ba-623c-4431-a8c6-2c32bc8880a7",
+      "name": "SMS - Resolution Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/REPLACE_ACCOUNT_SID/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $('Make Resolution Row').item.json.phone }}"
+            },
+            {
+              "name": "From",
+              "value": "+10000000000"
+            },
+            {
+              "name": "Body",
+              "value": "={{ $('Make Resolution Row').item.json.sms }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE",
+          "name": "Twilio (AccountSID:AuthToken)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "046aad37-f740-48d8-b31a-b16eb41c1e99",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        900
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "d5d09f2e-13f5-4dd6-a786-6592b2810c38",
+      "name": "GCal - List Next 24h",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        900
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "privateExtendedProperty",
+              "value": "source=voice-ai"
+            },
+            {
+              "name": "timeMin",
+              "value": "={{ $now.plus({ hours: 23 }).toUTC().toISO() }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $now.plus({ hours: 25 }).toUTC().toISO() }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "50"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "110197f0-f9a3-419e-befc-4051464eac30",
+      "name": "Build Reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        900
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = 'America/New_York', BIZ = 'Acme Dental';   // <-- match workflow 1 config\nconst items = ($input.first().json.items || []).filter(e => e.status !== 'cancelled' && e.extendedProperties?.private?.reminded !== 'true');\nreturn items.map(e => {\n  const p = e.extendedProperties?.private || {};\n  const label = DateTime.fromISO(e.start.dateTime, { zone: TZ }).toFormat(\"cccc, LLLL d 'at' h:mm a\");\n  const digits = String(p.phone || '').replace(/\\D/g, '');\n  return { json: { eventId: e.id, phone: digits ? '+' + digits : '', email: p.email || '', name: p.name || '', label,\n    sms: `${BIZ}: reminder - your appointment is ${label}. Need to change it? Call us.` } };\n});\n"
+      }
+    },
+    {
+      "id": "12480376-d183-4b5c-8d21-695ead7bb2c4",
+      "name": "Reminder Has Phone?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        900
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "b1f87aa6-fbbf-4e2e-9983-f5cb7188bdea",
+              "leftValue": "={{ !!$json.phone }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "fd911d98-b666-4f2e-8d8f-29f2178c7a84",
+      "name": "SMS - Reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        840
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/REPLACE_ACCOUNT_SID/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $json.phone }}"
+            },
+            {
+              "name": "From",
+              "value": "+10000000000"
+            },
+            {
+              "name": "Body",
+              "value": "={{ $json.sms }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE",
+          "name": "Twilio (AccountSID:AuthToken)"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "ec5176ec-6eb7-41ce-9032-d62c50ee8e58",
+      "name": "Reminder Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        960
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a2520b6b-8c42-425d-83ff-4a8290da6130",
+              "leftValue": "={{ !!$('Build Reminders').item.json.email }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8161fd3b-e51e-4dc8-8932-7f052728777e",
+      "name": "Email - Reminder (SMS fallback)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1440,
+        960
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Build Reminders').item.json.email }}",
+        "subject": "Appointment reminder",
+        "emailType": "text",
+        "message": "=Hi {{ $('Build Reminders').item.json.name }},\n\nA reminder that your appointment is {{ $('Build Reminders').item.json.label }}. Call us if you need to change it.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "70d46471-aa76-4a81-8a58-c9f4cba7c263",
+      "name": "Mark Reminded",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        880
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/primary/events/{{ $('Build Reminders').item.json.eventId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ extendedProperties: { private: { reminded: 'true' } } }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    }
+  ],
+  "connections": {
+    "Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Read Pending Bookings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Pending Bookings": {
+      "main": [
+        [
+          {
+            "node": "Prepare Retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Retry": {
+      "main": [
+        [
+          {
+            "node": "GCal - Create Event (retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Create Event (retry)": {
+      "main": [
+        [
+          {
+            "node": "Make Confirmed Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SMS - Booking Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Register Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Confirmed Row": {
+      "main": [
+        [
+          {
+            "node": "Mark Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Register Failure": {
+      "main": [
+        [
+          {
+            "node": "Mark Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Attempt": {
+      "main": [
+        [
+          {
+            "node": "Needs Human?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Human?": {
+      "main": [
+        [
+          {
+            "node": "HITL - Manual Booking Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HITL - Manual Booking Decision": {
+      "main": [
+        [
+          {
+            "node": "Make Resolution Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Resolution Row": {
+      "main": [
+        [
+          {
+            "node": "Mark Resolution",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SMS - Resolution Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "GCal - List Next 24h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - List Next 24h": {
+      "main": [
+        [
+          {
+            "node": "Build Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reminders": {
+      "main": [
+        [
+          {
+            "node": "Reminder Has Phone?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reminder Has Phone?": {
+      "main": [
+        [
+          {
+            "node": "SMS - Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reminder Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SMS - Reminder": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminded",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reminder Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reminder Has Email?": {
+      "main": [
+        [
+          {
+            "node": "Email - Reminder (SMS fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email - Reminder (SMS fallback)": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

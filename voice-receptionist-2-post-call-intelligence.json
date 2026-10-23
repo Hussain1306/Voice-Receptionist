@@ -1,0 +1,980 @@
+{
+  "name": "Voice Receptionist 2/3 - Post-Call Intelligence (CRM, HITL)",
+  "nodes": [
+    {
+      "id": "763e0283-4df4-44de-9145-86fb27a8f4a7",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        -360
+      ],
+      "parameters": {
+        "width": 960,
+        "height": 300,
+        "content": "## Voice Receptionist 2/3 - Post-Call Intelligence\nReceives the end-of-call report from workflow 1 -> GPT analysis (intent, outcome, sentiment, urgency, lead score, follow-up draft; fallback: keyword rules) -> call log (Sheet) -> Zoho lead upsert (4 retries; fallback: CRM_Queue + alert) + call note.\n\n**Selective alerts:** only high-urgency/emergency calls and CRM failures email you.\n**HITL:** complaints, negative sentiment, high urgency or `needsHuman` -> manager approval email. Approve = AI follow-up is sent to the caller (SMS, email fallback). Decline = Zoho task for staff.\n\n**Setup:** same credentials as workflow 1; Sheet tabs `Call_Log`, `CRM_Queue`."
+      }
+    },
+    {
+      "id": "eb62dc07-9c9b-4ffc-80d7-3fc32ee5229b",
+      "name": "Post-Call Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-post-call",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE",
+          "name": "Vapi / Pipeline Shared Secret"
+        }
+      },
+      "webhookId": "7aa5bd6c-f10c-4ae5-ab3e-b6b400440b04"
+    },
+    {
+      "id": "48b63f1a-ffca-4032-b6f8-d0b7fb04e210",
+      "name": "Extract Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst body = $input.first().json.body || $input.first().json;\nconst m = body.message || {}, call = m.call || {}, a = m.analysis || {};\nconst dur = m.durationSeconds ?? ((m.startedAt && m.endedAt) ? (new Date(m.endedAt) - new Date(m.startedAt)) / 1000 : 0);\nreturn [{ json: { callId: call.id || '', phone: (call.customer?.number || '').replace(/[^\\d+]/g, ''), startedAt: m.startedAt || '', endedAt: m.endedAt || '',\n  durationSec: Math.round(dur || 0), endedReason: m.endedReason || '', vapiSummary: m.summary || a.summary || '',\n  transcript: String(m.artifact?.transcript || m.transcript || '').slice(0, 12000), recordingUrl: m.recordingUrl || m.artifact?.recordingUrl || '', cost: m.cost || 0 } }];\n"
+      }
+    },
+    {
+      "id": "e95b29be-3b9b-44cb-b76c-224dd3a5d8a1",
+      "name": "Meaningful Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "673a96ae-7108-4e57-bc2d-e907e27e7a1b",
+              "leftValue": "={{ $json.durationSec >= 8 && $json.transcript.length > 40 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1c4f20df-d0c6-4910-86f0-d489e6ccb847",
+      "name": "AI Analysis - OpenAI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.2, response_format: { type: 'json_object' }, messages: [ { role: 'system', content: \"You analyze phone calls handled by an AI receptionist. Return ONLY JSON: {\\\"intent\\\":\\\"booking|reschedule|cancel|inquiry|complaint|emergency|spam|other\\\",\\\"outcome\\\":\\\"booked|rescheduled|cancelled|callback_needed|info_only|abandoned\\\",\\\"sentiment\\\":\\\"positive|neutral|negative\\\",\\\"urgency\\\":\\\"low|medium|high\\\",\\\"leadScore\\\":0-100,\\\"callerName\\\":string,\\\"email\\\":string,\\\"summary\\\":string (max 50 words),\\\"actionItems\\\":[string],\\\"followUpDraft\\\":string (a short, warm SMS to the caller, max 280 chars, no promises about prices or medical advice),\\\"needsHuman\\\":boolean}. Set needsHuman=true for complaints, emergencies, anger, legal/medical-risk topics, or unresolved requests.\" }, { role: 'user', content: JSON.stringify($json) } ] }) }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE",
+          "name": "OpenAI account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "1c74062b-27dd-4703-bcc5-c40da4e50666",
+      "name": "Parse Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        220
+      ],
+      "parameters": {
+        "jsCode": "\nlet r = null;\ntry { r = JSON.parse($input.first().json.choices[0].message.content); } catch (e) {}\nif (!r || !r.intent || !r.summary) return [{ json: { __bad: true } }];\nreturn [{ json: { intent: r.intent, outcome: r.outcome || 'info_only', sentiment: r.sentiment || 'neutral', urgency: r.urgency || 'low',\n  leadScore: Number(r.leadScore || 0), callerName: r.callerName || '', email: r.email || '', summary: r.summary, actionItems: r.actionItems || [],\n  followUpDraft: r.followUpDraft || '', needsHuman: !!r.needsHuman, mode: 'ai' } }];\n"
+      }
+    },
+    {
+      "id": "a9a7c4e3-9cda-45b9-b4b6-fc733b67da24",
+      "name": "Rule-Based Analysis (fallback)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        420
+      ],
+      "parameters": {
+        "jsCode": "\nconst c = $('Extract Report').first().json, t = c.transcript.toLowerCase();\nconst emergency = /emergency|urgent|bleeding|severe pain|can't breathe|accident/.test(t);\nconst complaint = /complain|angry|terrible|worst|unacceptable|refund|furious/.test(t);\nconst intent = emergency ? 'emergency' : complaint ? 'complaint' : /cancel/.test(t) ? 'cancel' : /reschedul|move my/.test(t) ? 'reschedule' : /book|appointment|schedule/.test(t) ? 'booking' : 'inquiry';\nreturn [{ json: { intent, outcome: /booked|confirmed/.test(t) ? 'booked' : 'info_only', sentiment: complaint ? 'negative' : 'neutral', urgency: emergency ? 'high' : complaint ? 'medium' : 'low',\n  leadScore: intent === 'booking' ? 60 : 30, callerName: '', email: '', summary: (c.vapiSummary || 'Call recorded - AI analysis unavailable.').slice(0, 300), actionItems: ['Review call manually'],\n  followUpDraft: '', needsHuman: emergency || complaint, mode: 'rules' } }];\n"
+      }
+    },
+    {
+      "id": "f44d8fb1-d9df-4f9c-8b1e-00e94e04f237",
+      "name": "Build Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst c = $('Extract Report').first().json;\nlet a = $input.first().json;\nif (a.__bad) { a = { intent: 'other', outcome: 'info_only', sentiment: 'neutral', urgency: 'low', leadScore: 20, callerName: '', email: '', summary: c.vapiSummary || 'Analysis unavailable', actionItems: ['Review call manually'], followUpDraft: '', needsHuman: true, mode: 'rules(parse-fail)' }; }\nconst needsReview = a.needsHuman || a.sentiment === 'negative' || a.urgency === 'high' || ['complaint', 'emergency'].includes(a.intent);\nconst urgentAlert = a.urgency === 'high' || a.intent === 'emergency';\nconst desc = [`AI call summary (${a.mode}): ${a.summary}`, `Intent: ${a.intent} | Outcome: ${a.outcome} | Sentiment: ${a.sentiment} | Urgency: ${a.urgency}`,\n  a.actionItems.length ? 'Actions: ' + a.actionItems.join('; ') : '', c.recordingUrl ? 'Recording: ' + c.recordingUrl : ''].filter(Boolean).join('\\n');\nconst record = { Last_Name: a.callerName || ('Caller ' + (c.phone || '').slice(-4)), Phone: c.phone || undefined, Email: a.email || undefined, Company: 'Phone Inquiry',\n  Lead_Status: a.outcome === 'booked' ? 'Pre-Qualified' : 'Contacted', Description: desc };\nreturn [{ json: { c, a, needsReview, urgentAlert, record, zohoBody: { data: [record], duplicate_check_fields: ['Phone'], trigger: ['workflow'] } } }];\n"
+      }
+    },
+    {
+      "id": "1c7dad82-8e4f-4a39-bbc3-e733cfccb262",
+      "name": "Make Call Log Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        80
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $input.first().json, c = p.c, a = p.a;\nreturn [{ json: { timestamp: new Date().toISOString(), callId: c.callId, phone: c.phone, durationSec: c.durationSec, endedReason: c.endedReason, intent: a.intent, outcome: a.outcome,\n  sentiment: a.sentiment, urgency: a.urgency, leadScore: a.leadScore, needsReview: p.needsReview, summary: a.summary, recordingUrl: c.recordingUrl, cost: c.cost, analysisMode: a.mode } }];\n"
+      }
+    },
+    {
+      "id": "90c8d72f-df82-4ad5-a587-aa3bec4c5e15",
+      "name": "Log - Call Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1720,
+        80
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Call_Log"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "081a9c1d-d444-4b77-9dfb-378350af28a9",
+      "name": "Urgent Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1480,
+        240
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "f9e0867f-8980-4ae2-810c-a615b8794422",
+              "leftValue": "={{ $json.urgentAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "67c36b96-52f3-46d8-b9ec-cd620d5fa63d",
+      "name": "Alert - Urgent Call",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1720,
+        240
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "=[URGENT] {{ $json.a.intent }} call from {{ $json.c.phone }}",
+        "emailType": "text",
+        "message": "=High-urgency call detected.\n\nPhone: {{ $json.c.phone }}\nIntent: {{ $json.a.intent }} | Sentiment: {{ $json.a.sentiment }}\nSummary: {{ $json.a.summary }}\nRecording: {{ $json.c.recordingUrl }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "ef30d791-0b51-4d17-bb44-7989dc3e899a",
+      "name": "Zoho - Upsert Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1480,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.com/crm/v6/Leads/upsert",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.zohoBody) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "41e9a813-27d2-4bf3-b62f-8c7f6da07911",
+      "name": "Zoho - Add Call Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1720,
+        380
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.com/crm/v6/Notes",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: [{ Note_Title: 'AI call ' + $('Build Payload').first().json.c.startedAt.slice(0,10), Note_Content: $('Build Payload').first().json.record.Description + '\\n\\nTranscript excerpt:\\n' + $('Build Payload').first().json.c.transcript.slice(0, 1500), Parent_Id: { module: { api_name: 'Leads' }, id: $json.data[0].details.id } }] }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "eec7d733-739e-4c8e-abda-708be584dbaa",
+      "name": "Make CRM Queue Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        560
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $('Build Payload').first().json, j = $input.first().json;\nreturn [{ json: { timestamp: new Date().toISOString(), callId: p.c.callId, phone: p.c.phone, status: 'pending', reason: String(j.error?.message || j.error || 'unknown').slice(0, 300), payload: JSON.stringify(p.zohoBody) } }];\n"
+      }
+    },
+    {
+      "id": "775a2650-ac80-4dd0-b188-38ee9a4d6a29",
+      "name": "Log - CRM Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1960,
+        560
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "CRM_Queue"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "ef7e0b48-b9bf-40d5-bb38-8d79e03b38cd",
+      "name": "Alert - CRM Sync Failed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2200,
+        560
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "[HIGH] Voice receptionist: Zoho CRM sync failed",
+        "emailType": "text",
+        "message": "=Zoho upsert failed after 4 retries. The lead payload is saved in CRM_Queue (call {{ $('Build Payload').first().json.c.callId }}).\n\nCommon causes: expired Zoho OAuth token, mandatory field, API credit limit.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "570ca4f6-994b-43a8-ac26-4fd10240b575",
+      "name": "Review Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        400
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $('Build Payload').first().json;\nlet leadId = '';\ntry { leadId = $('Zoho - Upsert Lead').first().json?.data?.[0]?.details?.id || ''; } catch (e) {}\nreturn [{ json: { ...p, leadId } }];\n"
+      }
+    },
+    {
+      "id": "8f4e4ed2-d710-43de-8930-7f4a3dc9a0b5",
+      "name": "Needs Manager Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2680,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4b2ca088-5c72-4d11-bd80-a66576f81413",
+              "leftValue": "={{ $json.needsReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "09e7eedc-c689-4d92-991f-15a916f2d89b",
+      "name": "HITL - Manager Review",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2920,
+        320
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "manager@yourcompany.com",
+        "subject": "=Review call: {{ $json.a.intent }} / {{ $json.a.sentiment }} / urgency {{ $json.a.urgency }} - {{ $json.c.phone }}",
+        "message": "=Summary: {{ $json.a.summary }}\n\nIntent: {{ $json.a.intent }} | Outcome: {{ $json.a.outcome }} | Sentiment: {{ $json.a.sentiment }} | Urgency: {{ $json.a.urgency }}\nActions: {{ $json.a.actionItems.join('; ') }}\nRecording: {{ $json.c.recordingUrl }}\n\nProposed follow-up to the caller:\n{{ $json.a.followUpDraft || '(none drafted)' }}\n\nApprove = send this follow-up now. Decline = do not send; create a callback task for staff.",
+        "responseType": "approval",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Send follow-up",
+            "disapproveLabel": "Do not send (create task)"
+          }
+        },
+        "options": {
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 12,
+              "resumeUnit": "hours"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "7ef2cdf0-9592-464a-843e-340568d5e061"
+    },
+    {
+      "id": "f4c1061d-f0e4-4da9-9b93-3460916dfd6f",
+      "name": "Apply Review Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3160,
+        320
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $('Review Check').first().json;\nreturn [{ json: { ...p, approved: $input.first().json?.data?.approved === true, canSend: !!p.a.followUpDraft && !!p.c.phone } }];\n"
+      }
+    },
+    {
+      "id": "f1ae7fb0-19db-4a01-a04a-6fad8478e426",
+      "name": "Send Follow-up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3400,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "b9f0a2ec-e9bd-438b-b439-d0e6556abdf4",
+              "leftValue": "={{ $json.approved && $json.canSend }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "94a34e2e-7642-44b6-b758-434155718d6d",
+      "name": "Send Follow-up SMS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3640,
+        240
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/REPLACE_ACCOUNT_SID/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $json.c.phone }}"
+            },
+            {
+              "name": "From",
+              "value": "+10000000000"
+            },
+            {
+              "name": "Body",
+              "value": "={{ $json.a.followUpDraft }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE",
+          "name": "Twilio (AccountSID:AuthToken)"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "1f0aff9e-5732-4679-95ac-f23c58c87b38",
+      "name": "Has Caller Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3880,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a8c6bb5d-9d07-4ebb-970f-ec024893469e",
+              "leftValue": "={{ !!$('Apply Review Decision').first().json.a.email }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "fa08c2d5-59ca-4da3-a595-8acf81bbd480",
+      "name": "Send Follow-up Email (SMS fallback)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4120,
+        320
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Apply Review Decision').first().json.a.email }}",
+        "subject": "Following up on your call",
+        "emailType": "text",
+        "message": "={{ $('Apply Review Decision').first().json.a.followUpDraft }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "b96ac8b0-cadb-46a9-ae19-326f42ac7d01",
+      "name": "Build Staff Task",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        480
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $input.first().json;\nconst due = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);\nreturn [{ json: { ...p, taskBody: { data: [{ Subject: `Call back (${p.a.intent}): ${p.c.phone}`, Due_Date: due, Priority: 'High', Status: 'Not Started', Description: p.a.summary,\n  ...(p.leadId ? { What_Id: { id: p.leadId }, '$se_module': 'Leads' } : {}) }] } } }];\n"
+      }
+    },
+    {
+      "id": "65d1ee08-5019-41f6-887e-20a7928c71a9",
+      "name": "Zoho - Create Staff Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3880,
+        480
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.com/crm/v6/Tasks",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.taskBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    }
+  ],
+  "connections": {
+    "Post-Call Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Report": {
+      "main": [
+        [
+          {
+            "node": "Meaningful Call?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Meaningful Call?": {
+      "main": [
+        [
+          {
+            "node": "AI Analysis - OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Analysis - OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Parse Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rule-Based Analysis (fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Analysis": {
+      "main": [
+        [
+          {
+            "node": "Build Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule-Based Analysis (fallback)": {
+      "main": [
+        [
+          {
+            "node": "Build Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Payload": {
+      "main": [
+        [
+          {
+            "node": "Make Call Log Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Urgent Call?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Zoho - Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Call Log Row": {
+      "main": [
+        [
+          {
+            "node": "Log - Call Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Urgent Call?": {
+      "main": [
+        [
+          {
+            "node": "Alert - Urgent Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zoho - Upsert Lead": {
+      "main": [
+        [
+          {
+            "node": "Zoho - Add Call Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Make CRM Queue Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zoho - Add Call Note": {
+      "main": [
+        [
+          {
+            "node": "Review Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make CRM Queue Row": {
+      "main": [
+        [
+          {
+            "node": "Log - CRM Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log - CRM Queue": {
+      "main": [
+        [
+          {
+            "node": "Alert - CRM Sync Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert - CRM Sync Failed": {
+      "main": [
+        [
+          {
+            "node": "Review Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Check": {
+      "main": [
+        [
+          {
+            "node": "Needs Manager Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Manager Review?": {
+      "main": [
+        [
+          {
+            "node": "HITL - Manager Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HITL - Manager Review": {
+      "main": [
+        [
+          {
+            "node": "Apply Review Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Review Decision": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-up?": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up SMS",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Staff Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-up SMS": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Has Caller Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Caller Email?": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up Email (SMS fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Staff Task": {
+      "main": [
+        [
+          {
+            "node": "Zoho - Create Staff Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,2431 @@
+{
+  "name": "Voice Receptionist 1/3 - Live Call Server (Vapi)",
+  "nodes": [
+    {
+      "id": "e4951091-3195-428c-8308-4a5fdb20e9f5",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -260,
+        -380
+      ],
+      "parameters": {
+        "width": 980,
+        "height": 320,
+        "content": "## Voice Receptionist 1/3 - Live Call Server (Vapi tool server)\nOne webhook = Vapi **Server URL**. Routes `tool-calls` (check availability, book, find, reschedule, cancel, request callback), `assistant-request` (caller recognition from Zoho, 7.5s budget) and `end-of-call-report` (acked instantly, forwarded to workflow 2).\n\n**Resilience:** every Google Calendar call retries 3x; on failure the caller still gets a graceful answer. Bookings fall back to **request mode** (saved to `Pending_Bookings`, retried by workflow 3) + throttled alert email. Re-booking is idempotent (deterministic event IDs). Reschedule/cancel require the caller's phone to match the event. SMS confirmation falls back to email. Post-call forward failure saves a raw report + alert.\n\n**Setup:** edit business config in 'Load Config'; connect Calendar, Sheets, Gmail, Zoho, Twilio (HTTP Basic: SID/Token), header-auth secret; set the pipeline URL in 'Forward To Post-Call'; set Error Workflow in Settings."
+      }
+    },
+    {
+      "id": "8ff4693f-df69-4abc-a729-4224ce3ec44c",
+      "name": "Vapi Server URL",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-receptionist",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE",
+          "name": "Vapi / Pipeline Shared Secret"
+        }
+      },
+      "webhookId": "242732fe-c917-4967-817e-f4daca20d12d"
+    },
+    {
+      "id": "150380f8-b3b8-40da-8747-eaece735d5e0",
+      "name": "Load Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst body = $input.first().json.body || $input.first().json;\nreturn [{ json: { body, cfg: {\n  businessName: 'Acme Dental',            // <-- edit per client\n  timezone: 'America/New_York',\n  calendarId: 'primary',\n  openDays: [1, 2, 3, 4, 5],              // Luxon weekdays: 1=Mon ... 7=Sun\n  openTime: '09:00', closeTime: '17:00',\n  slotStepMin: 30, bufferMin: 10, minNoticeMin: 60, maxDaysAhead: 60,\n  services: { consultation: 30, checkup: 45, cleaning: 60, emergency: 30 },\n  defaultServiceMin: 30,\n  assistantId: 'REPLACE_VAPI_ASSISTANT_ID'\n} } }];\n"
+      }
+    },
+    {
+      "id": "3e612fb4-40a1-4b8b-bc88-a4f0677168c8",
+      "name": "Route Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst { body, cfg } = $input.first().json;\nconst m = body.message || {};\nconst call = m.call || body.call || {};\nconst base = { cfg, callId: call.id || '', callerPhone: (call.customer?.number || '').replace(/[^\\d+]/g, '') };\nif (m.type === 'tool-calls') {\n  const list = m.toolCallList || m.toolCalls || (m.toolWithToolCallList || []).map(t => t.toolCall) || [];\n  const tc = list[0];\n  if (!tc) return [{ json: { ...base, route: 'ignore' } }];\n  let args = tc.arguments ?? tc.function?.arguments ?? {};\n  if (typeof args === 'string') { try { args = JSON.parse(args); } catch (e) { args = {}; } }\n  return [{ json: { ...base, route: 'tool', tool: tc.name || tc.function?.name, toolCallId: tc.id, args } }];\n}\nif (m.type === 'end-of-call-report') return [{ json: { ...base, route: 'eoc', raw: body } }];\nif (m.type === 'assistant-request') return [{ json: { ...base, route: 'assistant' } }];\nreturn [{ json: { ...base, route: 'ignore' } }];\n"
+      }
+    },
+    {
+      "id": "ffbcfce0-c101-4640-af65-db345ad5f808",
+      "name": "Route Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "bf1e1bb5-53da-4aa2-a57e-7b04bb8dbb38",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "tool",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "tool"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "09793989-4711-4cb7-a0c5-54fd1ad4f497",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "eoc",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "eoc"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "dd05dcb8-2371-4eae-881e-c4d7f0853875",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "assistant",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "assistant"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "0bf64026-d562-4417-a3d6-0943dadebf32",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "ignore",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "ignore"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "aef68f57-1400-4531-9633-17ba81bca6ce",
+      "name": "Tool Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        900,
+        80
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "a235df6e-14d1-4208-87f6-9a0480a7410a",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "check_availability",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "check_availability"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "632a0d01-b107-4a81-b322-20d9c5e4c426",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "book_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book_appointment"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "1b1d22d9-966f-4153-8ea0-5fdbbb172e64",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "find_appointments",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "find_appointments"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "9cb50a42-a0f6-4e67-afe8-525e0f9f0978",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "reschedule_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reschedule_appointment"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "b60d96a5-0ff1-4f96-bd05-687c8b45c6f0",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "cancel_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cancel_appointment"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "cd70c7ab-efcd-489c-80d8-9c2e6c6477eb",
+                    "leftValue": "={{ $json.tool }}",
+                    "rightValue": "request_callback",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "request_callback"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "e71da374-cb6b-4b21-a59a-4501a933c639",
+      "name": "Ack EOC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        700
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { response: { ok: true }, after: 'eoc', raw: $json.raw, callId: $json.callId } }];"
+      }
+    },
+    {
+      "id": "6e98a8ce-5747-49a6-abaa-fc70328b6870",
+      "name": "Ack Ignore",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        860
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { response: { ok: true }, after: 'none' } }];"
+      }
+    },
+    {
+      "id": "61651c37-c973-4146-abcd-1c516942a5b5",
+      "name": "Zoho - Caller Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        520
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.zohoapis.com/crm/v6/Leads/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "phone",
+              "value": "={{ $json.callerPhone }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 3000
+        }
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "00a2f295-07a7-4f75-abc6-03ffde2e569b",
+      "name": "Build Assistant Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        520
+      ],
+      "parameters": {
+        "jsCode": "\nconst r = $('Route Message').first().json, cfg = r.cfg;\nconst lead = (($input.first().json || {}).data || [])[0];\nconst now = DateTime.now().setZone(cfg.timezone);\nconst [oh, om] = cfg.openTime.split(':').map(Number), [ch, cm] = cfg.closeTime.split(':').map(Number);\nconst open = cfg.openDays.includes(now.weekday) && now >= now.set({ hour: oh, minute: om }) && now < now.set({ hour: ch, minute: cm });\nreturn [{ json: { after: 'none', response: { assistantId: cfg.assistantId, assistantOverrides: { variableValues: {\n  callerName: lead ? (lead.First_Name || lead.Last_Name || '') : '', isReturning: !!lead,\n  currentDate: now.toFormat(\"cccc, LLLL d, yyyy\"), currentTime: now.toFormat('h:mm a'), businessOpen: open, businessName: cfg.businessName } } } } }];\n"
+      }
+    },
+    {
+      "id": "dec5d8a6-c141-4480-a526-fa4250245cb0",
+      "name": "Build FreeBusy Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        -300
+      ],
+      "parameters": {
+        "jsCode": "\nconst r = $('Route Message').first().json, cfg = r.cfg, a = r.args || {};\nconst tz = cfg.timezone, now = DateTime.now().setZone(tz);\nlet d = a.date ? DateTime.fromISO(a.date, { zone: tz }) : now;\nif (!d.isValid) d = now;\nd = d.startOf('day'); if (d < now.startOf('day')) d = now.startOf('day');\nreturn [{ json: { cfg, fbBody: { timeMin: d.toUTC().toISO(), timeMax: d.plus({ days: 7 }).endOf('day').toUTC().toISO(), timeZone: tz, items: [{ id: cfg.calendarId }] } } }];\n"
+      }
+    },
+    {
+      "id": "49147bad-badb-4adf-8dae-e4f5abdfabfb",
+      "name": "GCal - FreeBusy (7 days)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        -300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.fbBody) }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "6901af99-c498-4243-83aa-c6fd85730487",
+      "name": "Compute Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        -340
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, cfg = r.cfg, a = r.args || {}, tz = cfg.timezone;\nconst cal = Object.values($input.first().json.calendars || {})[0] || {};\nconst busy = (cal.busy || []).map(b => ({ s: DateTime.fromISO(b.start), e: DateTime.fromISO(b.end) }));\nconst dur = cfg.services[String(a.service || '').toLowerCase().trim()] || cfg.defaultServiceMin;\nconst now = DateTime.now().setZone(tz), earliest = now.plus({ minutes: cfg.minNoticeMin });\nlet day = a.date ? DateTime.fromISO(a.date, { zone: tz }) : now;\nif (!day.isValid) day = now;\nday = day.startOf('day'); if (day < now.startOf('day')) day = now.startOf('day');\nconst pref = String(a.preferredTime || '').toLowerCase().trim();\nconst [oh, om] = cfg.openTime.split(':').map(Number), [ch, cm] = cfg.closeTime.split(':').map(Number);\nfunction slotsFor(d) {\n  if (!cfg.openDays.includes(d.weekday)) return [];\n  const out = []; let t = d.set({ hour: oh, minute: om }); const close = d.set({ hour: ch, minute: cm });\n  while (t.plus({ minutes: dur }) <= close) {\n    const e = t.plus({ minutes: dur });\n    const clash = busy.some(b => t < b.e.plus({ minutes: cfg.bufferMin }) && e.plus({ minutes: cfg.bufferMin }) > b.s);\n    if (t >= earliest && !clash) out.push(t);\n    t = t.plus({ minutes: cfg.slotStepMin });\n  }\n  return out;\n}\nfunction pick(list) {\n  let l = list;\n  if (pref === 'morning') l = list.filter(t => t.hour < 12);\n  else if (pref === 'afternoon') l = list.filter(t => t.hour >= 12);\n  else if (/^\\d{1,2}:\\d{2}$/.test(pref)) {\n    const [h, m] = pref.split(':').map(Number), tgt = h * 60 + m;\n    l = [...list].sort((x, y) => Math.abs(x.hour * 60 + x.minute - tgt) - Math.abs(y.hour * 60 + y.minute - tgt)).slice(0, 3).sort((x, y) => x.toMillis() - y.toMillis());\n  }\n  if (!l.length) l = list;\n  return l.slice(0, 3);\n}\nlet found = null, foundDay = null;\nfor (let i = 0; i < 7; i++) { const d = day.plus({ days: i }); const s = slotsFor(d); if (s.length) { found = pick(s); foundDay = d; break; } }\nlet msg, slots = [];\nif (!found) msg = 'There are no openings in the next 7 days. Offer to take a callback request instead.';\nelse {\n  const req = a.date ? DateTime.fromISO(a.date, { zone: tz }) : null;\n  const same = !req || !req.isValid || req.hasSame(foundDay, 'day');\n  slots = found.map(t => ({ start: t.toISO(), label: t.toFormat('h:mm a') }));\n  msg = `${same ? '' : 'Nothing was open on the requested date. '}Available on ${foundDay.toFormat('cccc, LLLL d')}: ${slots.map(s => s.label).join(', ')}. Appointment length ${dur} minutes.`;\n}\nreturn [mk(r, { message: msg, slots, durationMin: dur }, 'none')];\n"
+      }
+    },
+    {
+      "id": "3f2f5d1c-0a6f-431b-9ba3-90a9cf054157",
+      "name": "Build Booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, cfg = r.cfg, a = r.args || {}, tz = cfg.timezone;\nconst bad = m => [mk(r, { success: false, message: m }, 'none', { invalid: true })];\nconst start = DateTime.fromISO(String(a.startTime || ''), { zone: tz });\nif (!a.name || !start.isValid) return bad('I still need the caller name and a valid start time before I can book.');\nconst svc = String(a.service || '').toLowerCase().trim();\nconst dur = cfg.services[svc] || cfg.defaultServiceMin, end = start.plus({ minutes: dur }), now = DateTime.now().setZone(tz);\nconst [oh, om] = cfg.openTime.split(':').map(Number), [ch, cm] = cfg.closeTime.split(':').map(Number);\nif (!cfg.openDays.includes(start.weekday) || start < start.set({ hour: oh, minute: om }) || end > start.set({ hour: ch, minute: cm })) return bad('That time is outside business hours. Offer to check availability.');\nif (start < now.plus({ minutes: cfg.minNoticeMin })) return bad('That time is too soon. Offer the next available slot.');\nif (start > now.plus({ days: cfg.maxDaysAhead })) return bad('That date is too far ahead. Offer a closer date.');\nconst phone = String(a.phone || r.callerPhone || '').replace(/[^\\d+]/g, '');\nreturn [{ json: { tool: 'book', cfg, callId: r.callId, callerPhone: r.callerPhone, slot: { start: start.toISO(), end: end.toISO(), durationMin: dur },\n  service: svc || 'general', name: String(a.name).trim(), phone, email: String(a.email || '').trim(), notes: String(a.notes || '').slice(0, 500),\n  fbBody: { timeMin: start.minus({ minutes: cfg.bufferMin }).toUTC().toISO(), timeMax: end.plus({ minutes: cfg.bufferMin }).toUTC().toISO(), timeZone: tz, items: [{ id: cfg.calendarId }] } } }];\n"
+      }
+    },
+    {
+      "id": "e1454bc7-84cd-4c9f-8ae9-d635f7dcbcb5",
+      "name": "Build Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        120
+      ],
+      "parameters": {
+        "jsCode": "\nconst r = $('Route Message').first().json, a = r.args || {};\nconst digits = String(a.phone || r.callerPhone || '').replace(/\\D/g, '') || '0';   // '0' matches nothing: never list everyone's events\nreturn [{ json: { cfg: r.cfg, digits, timeMin: DateTime.now().toUTC().toISO() } }];\n"
+      }
+    },
+    {
+      "id": "0ab254c4-8f98-4e32-88d5-a23eff4f653d",
+      "name": "GCal - Find Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        120
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.cfg.calendarId) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "privateExtendedProperty",
+              "value": "=phone={{ $json.digits }}"
+            },
+            {
+              "name": "timeMin",
+              "value": "={{ $json.timeMin }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "5"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "165950e3-5a63-4c90-a7d4-72d81f35f652",
+      "name": "Format Appointments",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        80
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, tz = r.cfg.timezone;\nconst items = ($input.first().json.items || []).filter(e => e.status !== 'cancelled').map(e => ({\n  eventId: e.id, service: e.extendedProperties?.private?.service || 'appointment',\n  when: DateTime.fromISO(e.start?.dateTime, { zone: tz }).toFormat(\"cccc, LLLL d 'at' h:mm a\") }));\nconst message = items.length ? `Found ${items.length} upcoming appointment(s): ` + items.map(i => `${i.service} on ${i.when}`).join('; ') : 'No upcoming appointments were found for this phone number.';\nreturn [mk(r, { message, appointments: items }, 'none')];\n"
+      }
+    },
+    {
+      "id": "075db6f6-ce93-4b0b-a0d7-2ee3878ada16",
+      "name": "Build Change Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        340
+      ],
+      "parameters": {
+        "jsCode": "\nconst r = $('Route Message').first().json;\nreturn [{ json: { cfg: r.cfg, callId: r.callId, callerPhone: r.callerPhone, args: r.args || {}, eventId: String((r.args || {}).eventId || '').trim() || 'missing',\n  action: r.tool === 'cancel_appointment' ? 'cancel' : 'reschedule' } }];\n"
+      }
+    },
+    {
+      "id": "2dd20429-c12d-441e-900c-3232dfd1af4d",
+      "name": "GCal - Get Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        340
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.cfg.calendarId) }}/events/{{ $json.eventId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "6d3d0f71-21cc-42b9-bd20-d01e5377aaf1",
+      "name": "Verify Owner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        340
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Build Change Request').first().json, ev = $input.first().json;\nconst p = ev.extendedProperties?.private || {};\nconst evPhone = String(p.phone || '').replace(/\\D/g, '');\nconst caller = String(ctx.callerPhone || '').replace(/\\D/g, ''), given = String(ctx.args.phone || '').replace(/\\D/g, '');\nconst ownerOk = !!evPhone && (evPhone === caller || evPhone === given) && ev.status !== 'cancelled';\nreturn [{ json: { ...ctx, ownerOk, event: { id: ev.id, start: ev.start?.dateTime, end: ev.end?.dateTime, service: p.service || 'appointment', name: p.name || '', email: p.email || '' } } }];\n"
+      }
+    },
+    {
+      "id": "d7672c93-d81c-402b-b99e-ffe3e5adb88d",
+      "name": "Owner OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1860,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "9eed1c3c-c838-466d-a2ad-9074e08f60b9",
+              "leftValue": "={{ $json.ownerOk }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "35bdea3e-731e-46d1-af04-da28bf3a7358",
+      "name": "Not Verified Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        480
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json;\nreturn [mk(r, { success: false, message: 'I could not verify that appointment against the number you are calling from. Offer to take a callback request so staff can help.' }, 'none')];\n"
+      }
+    },
+    {
+      "id": "ea0df183-042f-4c3c-81bc-30c24d1c44b5",
+      "name": "Is Cancel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2100,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c9aba260-2a7e-4354-b6c2-fc40d0c09d28",
+              "leftValue": "={{ $json.action === 'cancel' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b4cf319c-0412-4ec6-9453-31502e287587",
+      "name": "GCal - Cancel Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2340,
+        220
+      ],
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.cfg.calendarId) }}/events/{{ $json.eventId }}?sendUpdates=all",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "5ef7ff71-3c83-4894-b2a9-b9ba2c85e2e7",
+      "name": "Format Cancel Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        180
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, c = $('Verify Owner').first().json, tz = r.cfg.timezone;\nconst label = DateTime.fromISO(c.event.start, { zone: tz }).toFormat(\"cccc, LLLL d 'at' h:mm a\");\nreturn [mk(r, { success: true, message: `Your ${c.event.service} on ${label} has been cancelled.` }, 'booking_event', {\n  notify: { kind: 'cancelled', name: c.event.name, phone: c.callerPhone, email: c.event.email, sms: `${r.cfg.businessName}: your appointment on ${label} has been cancelled.`,\n            subject: 'Appointment cancelled', body: `Your appointment on ${label} has been cancelled. Call us anytime to rebook.` },\n  logRow: { timestamp: new Date().toISOString(), event: 'cancelled', eventId: c.eventId, name: c.event.name, phone: c.callerPhone, email: c.event.email, service: c.event.service, start: c.event.start, callId: r.callId } })];\n"
+      }
+    },
+    {
+      "id": "19c8d2cd-db76-4c71-a847-a142585f0bb9",
+      "name": "Build Reschedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        400
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, c = $('Verify Owner').first().json, cfg = r.cfg, tz = cfg.timezone;\nconst bad = m => [mk(r, { success: false, message: m }, 'none', { invalid: true })];\nconst start = DateTime.fromISO(String(c.args.newStartTime || ''), { zone: tz });\nif (!start.isValid) return bad('I need the new date and time to reschedule.');\nconst dur = DateTime.fromISO(c.event.end).diff(DateTime.fromISO(c.event.start), 'minutes').minutes || cfg.defaultServiceMin;\nconst end = start.plus({ minutes: dur }), now = DateTime.now().setZone(tz);\nconst [oh, om] = cfg.openTime.split(':').map(Number), [ch, cm] = cfg.closeTime.split(':').map(Number);\nif (!cfg.openDays.includes(start.weekday) || start < start.set({ hour: oh, minute: om }) || end > start.set({ hour: ch, minute: cm })) return bad('That time is outside business hours. Offer to check availability.');\nif (start < now.plus({ minutes: cfg.minNoticeMin }) || start > now.plus({ days: cfg.maxDaysAhead })) return bad('That time is not available for rescheduling. Offer to check availability.');\nreturn [{ json: { tool: 'reschedule', cfg, callId: r.callId, callerPhone: r.callerPhone, eventId: c.eventId, event: c.event,\n  slot: { start: start.toISO(), end: end.toISO(), durationMin: dur }, service: c.event.service, name: c.event.name, phone: c.callerPhone, email: c.event.email, notes: '',\n  fbBody: { timeMin: start.minus({ minutes: cfg.bufferMin }).toUTC().toISO(), timeMax: end.plus({ minutes: cfg.bufferMin }).toUTC().toISO(), timeZone: tz, items: [{ id: cfg.calendarId }] } } }];\n"
+      }
+    },
+    {
+      "id": "4fddee55-a2a7-4544-bd6f-67cd43f7a6eb",
+      "name": "Request Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2580,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4fcb2865-aa06-4caa-8f98-cc1502808a6e",
+              "leftValue": "={{ !$json.invalid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "051df499-f517-4f6e-876a-2dc571245903",
+      "name": "Write Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2820,
+        380
+      ],
+      "parameters": {
+        "jsCode": "return $input.all();"
+      }
+    },
+    {
+      "id": "e4c1a4af-7d15-47e0-8058-9f88e99c31d8",
+      "name": "GCal - Recheck FreeBusy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3060,
+        380
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.fbBody) }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "0fe0801d-edeb-499d-b1d4-42040832260a",
+      "name": "Check Conflict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        380
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst g = $('Write Gate').first().json, cfg = g.cfg;\nconst busy = ((Object.values($input.first().json.calendars || {})[0] || {}).busy) || [];\nconst own = g.event ? [DateTime.fromISO(g.event.start).toMillis(), DateTime.fromISO(g.event.end).toMillis()] : null;\nconst conflict = busy.some(b => !(own && DateTime.fromISO(b.start).toMillis() === own[0] && DateTime.fromISO(b.end).toMillis() === own[1]));\nconst privateProps = { phone: String(g.phone || '').replace(/\\D/g, ''), name: g.name, service: g.service, email: g.email || '', callId: g.callId || '', source: 'voice-ai' };\nconst eventBody = { summary: `${g.service} - ${g.name}`, description: `Booked by AI receptionist.\\nPhone: ${g.phone}\\nNotes: ${g.notes || ''}`,\n  start: { dateTime: g.slot.start, timeZone: cfg.timezone }, end: { dateTime: g.slot.end, timeZone: cfg.timezone },\n  attendees: g.email ? [{ email: g.email }] : undefined, extendedProperties: { private: privateProps },\n  id: g.callId ? hid(`${g.callId}|${g.slot.start}|${privateProps.phone}`) : undefined };\nconst patchBody = { start: { dateTime: g.slot.start, timeZone: cfg.timezone }, end: { dateTime: g.slot.end, timeZone: cfg.timezone } };\nreturn [{ json: { ...g, conflict, eventBody, patchBody } }];\n"
+      }
+    },
+    {
+      "id": "44b47b2c-29e0-45cb-b3aa-2d8b27372e8f",
+      "name": "Slot Conflict?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3540,
+        380
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "1ee33ea6-1db6-4685-8059-53db9122fbe6",
+              "leftValue": "={{ $json.conflict }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c18af8c0-bb77-45a3-9a2a-8d830e00cf86",
+      "name": "Format Slot Taken",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3780,
+        520
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json;\nreturn [mk(r, { success: false, message: 'That slot was just taken. Apologize briefly and offer to check availability again.' }, 'none')];\n"
+      }
+    },
+    {
+      "id": "75f94d0b-cbc9-45b3-8ea3-e24634a71198",
+      "name": "Is New Booking?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3780,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4eb04603-fd28-4552-ad8a-4c1a9c98378e",
+              "leftValue": "={{ $json.tool === 'book' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "2fb7d904-8378-488a-89bc-6b8ebe49c467",
+      "name": "GCal - Create Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4020,
+        260
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.cfg.calendarId) }}/events?sendUpdates=all",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.eventBody) }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "804875b0-4dcc-4fec-b7b5-cad5aaf2fa87",
+      "name": "Format Booking Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4260,
+        220
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, g = $('Check Conflict').first().json, ev = $input.first().json;\nconst label = DateTime.fromISO(g.slot.start, { zone: g.cfg.timezone }).toFormat(\"cccc, LLLL d 'at' h:mm a\");\nreturn [mk(r, { success: true, message: `Booked ${g.service} for ${g.name} on ${label}. A confirmation will be sent after the call.`, eventId: ev.id }, 'booking_event', {\n  notify: { kind: 'booked', name: g.name, phone: g.phone, email: g.email, sms: `${g.cfg.businessName}: ${g.name}, your ${g.service} is confirmed for ${label}. Call us to change it.`,\n            subject: `Appointment confirmed - ${label}`, body: `Hi ${g.name},\\n\\nYour ${g.service} appointment at ${g.cfg.businessName} is confirmed for ${label}.\\n\\nNeed to change it? Just call us.` },\n  logRow: { timestamp: new Date().toISOString(), event: 'booked', eventId: ev.id, name: g.name, phone: g.phone, email: g.email, service: g.service, start: g.slot.start, callId: g.callId } })];\n"
+      }
+    },
+    {
+      "id": "9b3e8602-fa2d-4ac9-8373-8e2166438307",
+      "name": "GCal - Patch Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4020,
+        460
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($json.cfg.calendarId) }}/events/{{ $json.eventId }}?sendUpdates=all",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.patchBody) }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "7fbb9e21-7d62-46fb-b5bb-e2f7c63d8dd2",
+      "name": "Format Reschedule Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4260,
+        460
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, g = $('Check Conflict').first().json;\nconst label = DateTime.fromISO(g.slot.start, { zone: g.cfg.timezone }).toFormat(\"cccc, LLLL d 'at' h:mm a\");\nreturn [mk(r, { success: true, message: `Done - your ${g.service} is now on ${label}.` }, 'booking_event', {\n  notify: { kind: 'rescheduled', name: g.name, phone: g.phone, email: g.email, sms: `${g.cfg.businessName}: your appointment is moved to ${label}.`,\n            subject: `Appointment rescheduled - ${label}`, body: `Your appointment at ${g.cfg.businessName} is now ${label}.` },\n  logRow: { timestamp: new Date().toISOString(), event: 'rescheduled', eventId: g.eventId, name: g.name, phone: g.phone, email: g.email, service: g.service, start: g.slot.start, callId: g.callId } })];\n"
+      }
+    },
+    {
+      "id": "54a19bfb-655a-4397-a3b2-ffefa9687d96",
+      "name": "Build Callback Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        560
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json, a = r.args || {};\nconst info = { name: a.name || 'Unknown', phone: String(a.callbackNumber || r.callerPhone || ''), reason: String(a.reason || '').slice(0, 500), urgency: ['low', 'medium', 'high'].includes(a.urgency) ? a.urgency : 'medium' };\nreturn [mk(r, { success: true, message: 'Callback request recorded. Tell the caller a team member will call back soon.' }, 'callback', {\n  callbackInfo: info, logRow: { timestamp: new Date().toISOString(), callId: r.callId, ...info, status: 'open' } })];\n"
+      }
+    },
+    {
+      "id": "5220f837-8de6-4fe3-b3c1-98d41fde319e",
+      "name": "Unknown Tool Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        700
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst r = $('Route Message').first().json;\nreturn [mk(r, { success: false, message: 'That action is not supported. Offer to take a callback request.' }, 'none')];\n"
+      }
+    },
+    {
+      "id": "ad847671-2a9b-4544-8be7-dd5556ac6748",
+      "name": "Calendar Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        700
+      ],
+      "parameters": {
+        "jsCode": "\nfunction mk(r, obj, after, extra) {\n  return { json: { response: { results: [{ name: r.tool, toolCallId: r.toolCallId, result: JSON.stringify(obj) }] }, after: after || 'none', ...(extra || {}) } };\n}\nfunction hid(s) { let h1 = 5381, h2 = 52711; for (const c of s) { h1 = ((h1 * 33) ^ c.charCodeAt(0)) >>> 0; h2 = ((h2 * 31) + c.charCodeAt(0)) >>> 0; } return 'vap' + h1.toString(16) + h2.toString(16); }\n\nconst j = $input.first().json, r = $('Route Message').first().json;\nconst msg = String(j.error?.message || (typeof j.error === 'string' ? j.error : '') || j.message || '');\nif (/404|not found/i.test(msg)) return [mk(r, { success: false, message: 'I could not find that appointment.' }, 'none')];\nif (/409|already exists|duplicate/i.test(msg)) return [mk(r, { success: true, message: 'That appointment is already booked.' }, 'none')];\nconst g = $('Write Gate').isExecuted ? $('Write Gate').first().json : null;\nconst sd = $getWorkflowStaticData('global'), now = Date.now();\nconst alert = now - (sd.lastCalAlert || 0) > 20 * 60 * 1000;       // throttle: 1 alert / 20 min\nif (alert) sd.lastCalAlert = now;\nlet pending = null, obj;\nif (g && g.tool === 'book') {\n  pending = { requestId: hid(`${r.callId}|${g.slot.start}`), createdAt: new Date().toISOString(), status: 'pending', attempts: 0, name: g.name, phone: g.phone, email: g.email,\n    service: g.service, start: g.slot.start, end: g.slot.end, notes: g.notes, callId: r.callId, lastError: msg.slice(0, 200) };\n  obj = { success: true, pending: true, message: \"Our calendar is responding slowly, so I've saved this request and the team will confirm by text shortly. Tell the caller that.\" };\n} else obj = { success: false, message: \"I'm having trouble reaching the calendar. Offer to take a callback request.\" };\nreturn [mk(r, obj, 'calendar_down', { alert, pending, errorText: msg.slice(0, 300) })];\n"
+      }
+    },
+    {
+      "id": "d49b7ae9-8bbb-4736-a0f0-b28a8c8d37e5",
+      "name": "Respond Vapi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        4560,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "8fa6bb7c-117f-4a4e-94ee-1f71b24ddcbb",
+      "name": "Post-Respond Actions",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        4800,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "88b02a0f-b1fd-4564-a7a1-d9ee9aceab1a",
+                    "leftValue": "={{ $json.after }}",
+                    "rightValue": "booking_event",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "booking_event"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "2924a25d-6d39-42fd-93e9-d00b20baaa23",
+                    "leftValue": "={{ $json.after }}",
+                    "rightValue": "callback",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "callback"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "6dd72043-79ba-46ea-9a1f-1b67859e8700",
+                    "leftValue": "={{ $json.after }}",
+                    "rightValue": "calendar_down",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "calendar_down"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "6a89032e-044a-42ec-b8f1-57fbfdc7f20f",
+                    "leftValue": "={{ $json.after }}",
+                    "rightValue": "eoc",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "eoc"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "53c35eaf-26be-4122-8a37-1df518d53bfa",
+      "name": "Make Booking Log Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5060,
+        40
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $json.logRow }];"
+      }
+    },
+    {
+      "id": "768010b0-cf06-42ac-abcc-916cb2accaf7",
+      "name": "Log - Bookings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5300,
+        40
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Bookings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "a2af7ab1-d502-4f49-b751-a7a2191f16af",
+      "name": "Can SMS?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5060,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "1ebb3d12-8478-4f80-83fc-82a2867f56ca",
+              "leftValue": "={{ !!$json.notify.phone && $json.notify.phone.startsWith('+') }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1e712ae1-e484-4089-a38a-5e40350d5dfe",
+      "name": "Send SMS Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5300,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/REPLACE_ACCOUNT_SID/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "specifyBody": "keypair",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $json.notify.phone }}"
+            },
+            {
+              "name": "From",
+              "value": "+10000000000"
+            },
+            {
+              "name": "Body",
+              "value": "={{ $json.notify.sms }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE",
+          "name": "Twilio (AccountSID:AuthToken)"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "20df4bce-c8ef-49e7-bd97-6009271dfc19",
+      "name": "Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5540,
+        280
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "fab9448a-d72e-44a1-b96a-aecccac4fa91",
+              "leftValue": "={{ !!$('Post-Respond Actions').first().json.notify.email }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8dda071f-eb74-4356-8cef-b474fe315912",
+      "name": "Email Confirmation (SMS fallback)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5780,
+        260
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Post-Respond Actions').first().json.notify.email }}",
+        "subject": "={{ $('Post-Respond Actions').first().json.notify.subject }}",
+        "emailType": "text",
+        "message": "={{ $('Post-Respond Actions').first().json.notify.body }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "29874699-e776-4c92-acc5-848b1ccb75b3",
+      "name": "Make Callback Log Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5060,
+        420
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $json.logRow }];"
+      }
+    },
+    {
+      "id": "79e39bb3-31b1-4bd5-be24-2672f061fd3f",
+      "name": "Log - Callbacks",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5300,
+        420
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Callbacks"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "28a63d2f-d5b1-453e-8484-65f48aeddbad",
+      "name": "Email Staff - Callback Request",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5300,
+        560
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "frontdesk@yourcompany.com",
+        "subject": "=[Callback {{ $json.callbackInfo.urgency }}] {{ $json.callbackInfo.name }} - {{ $json.callbackInfo.phone }}",
+        "emailType": "text",
+        "message": "=A caller requested a human callback.\n\nName: {{ $json.callbackInfo.name }}\nPhone: {{ $json.callbackInfo.phone }}\nUrgency: {{ $json.callbackInfo.urgency }}\nReason: {{ $json.callbackInfo.reason }}\nCall ID: {{ $json.callId }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "806a6e30-7bcf-4a61-b06c-681de678f8f8",
+      "name": "Make Pending Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5060,
+        700
+      ],
+      "parameters": {
+        "jsCode": "return $json.pending ? [{ json: $json.pending }] : [];"
+      }
+    },
+    {
+      "id": "6e5dad72-0e70-4805-81d9-20bc0dce52cf",
+      "name": "Log - Pending Bookings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5300,
+        700
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Pending_Bookings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "7176dfc6-95e7-4a99-92d3-a88bdfe1b624",
+      "name": "Alert Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5060,
+        860
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c49ddabf-c0b8-4a7b-be43-cf6936f831ff",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "045b6898-0f5c-4168-b15d-e32a861a3ba6",
+      "name": "Alert - Calendar Unreachable",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5300,
+        860
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "[HIGH] Voice receptionist: Google Calendar unreachable",
+        "emailType": "text",
+        "message": "=Calendar calls failed after 3 retries. Callers are being served in request mode (saved to Pending_Bookings, auto-retried every 10 min).\n\nLast error: {{ $json.errorText }}\n\nCheck the Google Calendar OAuth credential and API quota. (Alerts throttled to 1 per 20 min.)",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "5c41c1f4-96b6-4658-8ca5-c6c75f90bf22",
+      "name": "Forward To Post-Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5060,
+        1040
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-N8N-DOMAIN/webhook/vapi-post-call",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.raw) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE",
+          "name": "Vapi / Pipeline Shared Secret"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "7234191f-ee71-48df-9b36-26d6b656d713",
+      "name": "Raw Report Dump",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5300,
+        1100
+      ],
+      "parameters": {
+        "jsCode": "\nconst raw = $('Post-Respond Actions').first().json.raw || {}, m = raw.message || {};\nreturn [{ json: { timestamp: new Date().toISOString(), callId: m.call?.id || '', phone: m.call?.customer?.number || '', endedReason: m.endedReason || '',\n  summary: String(m.summary || '').slice(0, 1500), recordingUrl: m.recordingUrl || '', transcript: String(m.transcript || '').slice(0, 4000) } }];\n"
+      }
+    },
+    {
+      "id": "99987544-10d8-400b-965c-2a23b274adb2",
+      "name": "Log - Raw Reports",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5540,
+        1100
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Raw_Reports"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "d17b63c8-af60-4540-ae32-25345262539c",
+      "name": "Alert - Post-Call Forward Failed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        5780,
+        1100
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "[HIGH] Voice receptionist: post-call processing unreachable",
+        "emailType": "text",
+        "message": "=Could not reach the Post-Call workflow after 3 retries. The raw report was saved to Raw_Reports (call {{ $('Raw Report Dump').first().json.callId }}). Reprocess it once the workflow is back.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Vapi Server URL": {
+      "main": [
+        [
+          {
+            "node": "Load Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Config": {
+      "main": [
+        [
+          {
+            "node": "Route Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Message": {
+      "main": [
+        [
+          {
+            "node": "Route Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Switch": {
+      "main": [
+        [
+          {
+            "node": "Tool Switch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ack EOC",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Zoho - Caller Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ack Ignore",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ack EOC": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ack Ignore": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zoho - Caller Lookup": {
+      "main": [
+        [
+          {
+            "node": "Build Assistant Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Assistant Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tool Switch": {
+      "main": [
+        [
+          {
+            "node": "Build FreeBusy Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Change Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Change Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Callback Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown Tool Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build FreeBusy Query": {
+      "main": [
+        [
+          {
+            "node": "GCal - FreeBusy (7 days)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - FreeBusy (7 days)": {
+      "main": [
+        [
+          {
+            "node": "Compute Slots",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Slots": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Booking": {
+      "main": [
+        [
+          {
+            "node": "Request Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Lookup": {
+      "main": [
+        [
+          {
+            "node": "GCal - Find Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Find Events": {
+      "main": [
+        [
+          {
+            "node": "Format Appointments",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Appointments": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Change Request": {
+      "main": [
+        [
+          {
+            "node": "GCal - Get Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Get Event": {
+      "main": [
+        [
+          {
+            "node": "Verify Owner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Owner": {
+      "main": [
+        [
+          {
+            "node": "Owner OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Owner OK?": {
+      "main": [
+        [
+          {
+            "node": "Is Cancel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not Verified Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Not Verified Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Cancel?": {
+      "main": [
+        [
+          {
+            "node": "GCal - Cancel Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Reschedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Cancel Event": {
+      "main": [
+        [
+          {
+            "node": "Format Cancel Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Cancel Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reschedule": {
+      "main": [
+        [
+          {
+            "node": "Request Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Valid?": {
+      "main": [
+        [
+          {
+            "node": "Write Gate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Gate": {
+      "main": [
+        [
+          {
+            "node": "GCal - Recheck FreeBusy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Recheck FreeBusy": {
+      "main": [
+        [
+          {
+            "node": "Check Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Conflict": {
+      "main": [
+        [
+          {
+            "node": "Slot Conflict?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Conflict?": {
+      "main": [
+        [
+          {
+            "node": "Format Slot Taken",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is New Booking?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slot Taken": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is New Booking?": {
+      "main": [
+        [
+          {
+            "node": "GCal - Create Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal - Patch Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Create Event": {
+      "main": [
+        [
+          {
+            "node": "Format Booking Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Booking Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal - Patch Event": {
+      "main": [
+        [
+          {
+            "node": "Format Reschedule Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calendar Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reschedule Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Callback Request": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown Tool Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar Fallback": {
+      "main": [
+        [
+          {
+            "node": "Respond Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Vapi": {
+      "main": [
+        [
+          {
+            "node": "Post-Respond Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post-Respond Actions": {
+      "main": [
+        [
+          {
+            "node": "Make Booking Log Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Can SMS?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Make Callback Log Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Staff - Callback Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Make Pending Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Alert Due?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Forward To Post-Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Booking Log Row": {
+      "main": [
+        [
+          {
+            "node": "Log - Bookings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can SMS?": {
+      "main": [
+        [
+          {
+            "node": "Send SMS Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SMS Confirmation": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email?": {
+      "main": [
+        [
+          {
+            "node": "Email Confirmation (SMS fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Callback Log Row": {
+      "main": [
+        [
+          {
+            "node": "Log - Callbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Make Pending Row": {
+      "main": [
+        [
+          {
+            "node": "Log - Pending Bookings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Due?": {
+      "main": [
+        [
+          {
+            "node": "Alert - Calendar Unreachable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forward To Post-Call": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Raw Report Dump",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Raw Report Dump": {
+      "main": [
+        [
+          {
+            "node": "Log - Raw Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log - Raw Reports": {
+      "main": [
+        [
+          {
+            "node": "Alert - Post-Call Forward Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
